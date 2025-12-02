@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.scanner-reticle {
+	/* Positioning */
+	position: absolute;
+	top: 50%; /* Center vertically */
+	left: 50%; /* Center horizontally */
+	transform: translate(-50%, -50%); /* Fine-tune centering */
+
+	/* Size (adjust as needed) */
+	width: 80%; /* Example: 80% of the scanner width */
+	height: 100px; /* Example: Fixed height */
+	max-width: 400px; /* Example: Max width */
+
+	/* Appearance */
+	border: 3px solid red;
+	box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5); /* Creates the dark overlay effect around the box */
+
+	/* Ensure it's above the video */
+	z-index: 10;
+}
