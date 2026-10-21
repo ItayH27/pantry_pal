@@ -10,7 +10,7 @@ function ItemForm({ onSubmit, initialData = {}, onCancel }) {
 		barcode: initialData.barcode || '',
 		name: initialData.name || '',
 		brand: initialData.brand || '',
-		quantity: initialData.quantity || '',
+		quantity: initialData.quantity ?? '',
 		unit: initialData.unit || '',
 		expires_on: initialData.expires_on || '',
 		category: initialData.category || '',
@@ -96,7 +96,7 @@ function ItemForm({ onSubmit, initialData = {}, onCancel }) {
             barcode: formData.barcode, // Use the state value
             name: formData.name || null,
             brand: formData.brand || null,
-            quantity: formData.quantity ? parseFloat(formData.quantity) : null,
+            quantity: formData.quantity !== '' ? parseFloat(formData.quantity) : null,
             unit: formData.unit || null,
             expires_on: formData.expires_on || null,
 			category: formData.category || null,
@@ -104,9 +104,10 @@ function ItemForm({ onSubmit, initialData = {}, onCancel }) {
 			image_url: formData.image_url || null,
         };
 
-        // Don't send barcode on edit
+        // Don't send barcode or image on edit (neither is editable)
         if (isEditMode) {
             delete dataToSubmit.barcode;
+            delete dataToSubmit.image_url;
             // Ensure barcode isn't required during edit by backend logic
         } else if (!dataToSubmit.barcode) {
              // Basic check to prevent submitting if barcode somehow became empty

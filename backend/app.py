@@ -7,21 +7,25 @@ from sib_api_v3_sdk.rest import ApiException
 import re
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, ConfigDict
-from sqlalchemy import create_engine, text, select
-from sqlalchemy.orm import sessionmaker, declarative_base, Mapped, mapped_column, relationship
+from sqlalchemy import create_engine, select, func, Index
+from sqlalchemy.orm import Session, sessionmaker, declarative_base, Mapped, mapped_column, relationship
 from sqlalchemy import String, Integer, Date, DateTime, ForeignKey, Numeric
-from contextlib import asynccontextmanager
+
+load_dotenv()
 
 # -----------------------------
 # Config
 # -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
 # Fix URL for psycopg (v3) driver *before* engine is created
 if DATABASE_URL.startswith("postgres://"):
@@ -42,25 +46,7 @@ CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5
 # App & CORS
 # -----------------------------
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ensure +psycopg driver in prod
-    raw = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
-    if raw.startswith("postgres://"):
-        raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
-    elif raw.startswith("postgresql://") and "+psycopg" not in raw:
-        raw = raw.replace("postgresql://", "postgresql+psycopg://", 1)
-    # (re)create engine with the corrected URL
-    engine.dispose()
-    eng = create_engine(raw, pool_pre_ping=True)
-    # create tables
-    with eng.begin() as conn:
-        Base.metadata.create_all(conn)
-    yield
-    # (optional) cleanup
-    eng.dispose()
-
-app = FastAPI(title="Pantry Pal API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Pantry Pal API", version="0.1.0")
 
 # CORS middleware configuration so the frontend (Vercel) can call the backend (Render) from a different origin (domain/port)
 app.add_middleware(
@@ -109,8 +95,10 @@ class Item(Base):
     # Relationship to user
     user: Mapped[User] = relationship("User", back_populates="items")
 
-# Create tables on startup
-Base.metadata.create_all(bind=engine)
+    # Speeds up the per-user expiry queries (expiring soon list + stats)
+    __table_args__ = (Index("ix_items_user_expires", "user_id", "expires_on"),)
+
+# Schema is managed by Alembic (see alembic/), not create_all
 
 # -----------------------------
 # Auth helpers
@@ -193,9 +181,7 @@ class PasswordResetRequest(BaseModel):
     token: str
     new_password: str
 
-# Dependency to get DB session
-from contextlib import contextmanager
-@contextmanager
+# Dependency to get DB session (one per request, shared by all dependencies)
 def get_db():
     db = SessionLocal()
     try:
@@ -205,9 +191,6 @@ def get_db():
 
 # password hashing and verification
 def get_password_hash(password: str) -> str:
-    # --- BEGIN DEBUG LOGGING ---
-    print(f"Hashing password: '{password}' (Length: {len(password.encode('utf-8'))} bytes)")
-    # --- END DEBUG LOGGING ---
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -221,7 +204,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire}) # add expiry to payload
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG) # create the JWT
 
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -236,11 +219,17 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
         raise credentials_exception
     
     # Get user from DB
-    with get_db() as db:
-        user = db.get(User, int(user_id))
-        if not user:
-            raise credentials_exception
-        return user
+    user = db.get(User, int(user_id))
+    if not user:
+        raise credentials_exception
+    return user
+
+def get_owned_item(db: Session, item_id: int, user: User) -> Item:
+    """Returns the item if it exists and belongs to user, otherwise 404."""
+    item = db.scalar(select(Item).where(Item.id == item_id, Item.user_id == user.id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
 
 
 def verify_password_reset_token(token: str) -> Optional[str]:
@@ -299,62 +288,49 @@ def send_password_reset_email(to_email: str, token: str):
 
 # create new user
 @app.post("/auth/register", response_model=TokenData)
-def register_user(user_in: UserCreate):
-    with get_db() as db:
-        # check if user already exists
-        existing_user = db.execute(select(User).where(User.email == user_in.email)).scalar_one_or_none()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        
-        # create new user
-        new_user = User(
-            email=user_in.email,
-            password_hash=get_password_hash(user_in.password)
-        )
+def register_user(user_in: UserCreate, db: Session = Depends(get_db)):
+    # check if user already exists
+    existing_user = db.scalar(select(User).where(User.email == user_in.email))
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
 
-        # save to DB
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
+    # create new user and save to DB
+    new_user = User(
+        email=user_in.email,
+        password_hash=get_password_hash(user_in.password)
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
 
-        token = create_access_token(data={"sub": str(new_user.id)})
-
-        return TokenData(access_token=token)
+    token = create_access_token(data={"sub": str(new_user.id)})
+    return TokenData(access_token=token)
 
 # login user and return JWT token
 @app.post("/auth/login", response_model=TokenData)
-def login_user(form_data: OAuth2PasswordRequestForm = Depends()):
-    with get_db() as db:
-        # get user by email
-        row = db.execute(
-            text("SELECT id, email, password_hash FROM users WHERE email = :e"),
-            {"e": form_data.username}
-        ).first()
+def login_user(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # get user by email
+    user = db.scalar(select(User).where(User.email == form_data.username))
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
 
-        if not row: # user not found
-            raise HTTPException(status_code=400, detail="Incorrect email or password")
-        uid, email, password_hash = row
-        if not verify_password(form_data.password, password_hash): # invalid password
-            raise HTTPException(status_code=400, detail="Incorrect email or password")
-        
-        # create and return JWT token
-        token = create_access_token(data={"sub": str(uid)})
-        return TokenData(access_token=token)
-    
+    # create and return JWT token
+    token = create_access_token(data={"sub": str(user.id)})
+    return TokenData(access_token=token)
+
 # -----------------------------
 # Routes: Items
 # -----------------------------
 
-# list items for current user
+# list items for current user, most recently added first
 @app.get("/items/", response_model=List[ItemOut])
-def list_items(current_user: User = Depends(get_current_user)):
-    with get_db() as db:
-        # fetch items for current user ordered by created_at descending
-        items = db.execute(text(
-            "SELECT id, barcode, name, brand, quantity, unit, expires_on, created_at, image_url, category, location FROM items WHERE user_id=:u ORDER BY created_at DESC"
-        ), {"u": current_user.id}).all()
-        return [ItemOut(**dict(i._mapping)) for i in items]
-    
+def list_items(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.scalars(
+        select(Item)
+        .where(Item.user_id == current_user.id)
+        .order_by(Item.created_at.desc(), Item.id.desc())
+    ).all()
+
 
 @app.get("/items/barcode-lookup/{barcode}", response_model=BarcodeLookupOut)
 async def barcode_lookup(barcode: str):
@@ -429,214 +405,102 @@ async def barcode_lookup(barcode: str):
 
 # add new item for current user
 @app.post("/items/", response_model=ItemOut, status_code=201)
-def add_item(item_in: ItemCreate, current_user: User = Depends(get_current_user)):
+def add_item(item_in: ItemCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     # Validate barcode
     if not item_in.barcode or not item_in.barcode.strip():
         raise HTTPException(status_code=400, detail="Barcode is required")
 
-    # Get all data directly from input
-    barcode = item_in.barcode.strip()
-    name = item_in.name
-    brand = item_in.brand
-    quantity = item_in.quantity
-    unit = item_in.unit.lower() if item_in.unit else None # Ensure unit is lowercase
-    category = item_in.category
-    location = item_in.location
-    image_url = item_in.image_url
+    fields = item_in.model_dump()
+    fields["barcode"] = item_in.barcode.strip()
+    fields["unit"] = item_in.unit.lower() if item_in.unit else None # Ensure unit is lowercase
 
-    # Insert item into DB
-    with get_db() as db:
-        result = db.execute(text(
-            """
-            INSERT INTO items (user_id, barcode, name, brand, quantity, unit, expires_on, created_at, image_url, category, location)
-            VALUES (:user_id, :barcode, :name, :brand, :quantity, :unit, :expires_on, NOW(), :image_url, :category, :location)
-            RETURNING id, barcode, name, brand, quantity, unit, expires_on, created_at, image_url, category, location
-            """
-        ), {
-            "user_id": current_user.id,
-            "barcode": barcode, # Use stripped barcode
-            "name": name,
-            "brand": brand,
-            "quantity": quantity,
-            "unit": unit,       # Use lowercased unit
-            "expires_on": item_in.expires_on,
-            "image_url": image_url,
-            "category": category,
-            "location": location,
-        })
-        row = result.first()
-        if not row:
-             raise HTTPException(status_code=500, detail="Failed to create item after insert.")
-        db.commit()
-
-        # Return the created item
-        return ItemOut(**dict(row._mapping))
+    item = Item(user_id=current_user.id, **fields)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
 
 # update existing item for current user
 @app.patch("/items/{item_id}", response_model=ItemOut)
-def update_item(item_id: int, patch: ItemUpdate, current_user: User = Depends(get_current_user)):
-    with get_db() as db:
-        # Ensure item belongs to current user
-        owner = db.execute(
-            text("SELECT user_id FROM items WHERE id = :id"),
-            {"id": item_id}
-        ).first()
-        if not owner:
-            raise HTTPException(status_code=404, detail="Item not found")
-        if owner[0] != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to update this item")
-        
-        unit_patched = patch.unit.lower() if patch.unit else None
-        
-        # Update item with provided fields
-        result = db.execute(text(
-            """
-            UPDATE items SET
-                quantity = COALESCE(:quantity, quantity),
-                unit = COALESCE(:unit, unit),
-                expires_on = COALESCE(:expires_on, expires_on),
-                name = COALESCE(:name, name),
-                brand = COALESCE(:brand, brand),
-                category = COALESCE(:category, category),
-                location = COALESCE(:location, location)
-            WHERE id=:id
-            RETURNING id, barcode, name, brand, quantity, unit, expires_on, created_at, image_url, category, location
-            """
-        ),{
-            "id": item_id,
-            "quantity": patch.quantity,
-            "unit": unit_patched,
-            "expires_on": patch.expires_on,
-            "name": patch.name,
-            "brand": patch.brand,
-            "category": patch.category,
-            "location": patch.location,
-        })
+def update_item(item_id: int, patch: ItemUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = get_owned_item(db, item_id, current_user)
 
-        # Get the updated row
-        row = result.first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Item not found after update")
-        db.commit() # commit the transaction
+    # Only apply fields the client sent; an explicit null clears the field
+    changes = patch.model_dump(exclude_unset=True)
+    if changes.get("unit"):
+        changes["unit"] = changes["unit"].lower()
+    for field, value in changes.items():
+        setattr(item, field, value)
 
-        # Return the updated item
-        return ItemOut(
-            id=row[0], barcode=row[1], name=row[2], brand=row[3],
-            quantity=float(row[4]) if row[4] is not None else None,
-            unit=row[5], expires_on=row[6], created_at=row[7], image_url=row[8],
-            category=row[9], location=row[10]
-        )
+    db.commit()
+    db.refresh(item)
+    return item
 
 @app.delete("/items/{item_id}", status_code=204)
-def delete_item(item_id: int, current_user: User = Depends(get_current_user)):
-    with get_db() as db:
-        # Ensure item belongs to current user
-        owner = db.execute(
-            text("SELECT user_id FROM items WHERE id = :id"),
-            {"id": item_id}
-        ).first()
+def delete_item(item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = get_owned_item(db, item_id, current_user)
+    db.delete(item)
+    db.commit()
 
-        if not owner:
-            raise HTTPException(status_code=404, detail="Item not found")
-        if owner[0] != current_user.id:
-            raise HTTPException(status_code=403, detail="Not authorized to delete this item")
-        
-        # Delete the item
-        db.execute(
-            text("DELETE FROM items WHERE id = :id"),
-            {"id": item_id}
-        )
-        db.commit() # commit the transaction
-        return
-    
+# items expiring within 7 days, including already expired ones
 @app.get("/items/expiring_soon/", response_model=List[ItemOut])
-def list_expiring_soon_items(current_user: User = Depends(get_current_user)):
+def list_expiring_soon_items(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    soon_date = date.today() + timedelta(days=7)
+    return db.scalars(
+        select(Item)
+        .where(
+            Item.user_id == current_user.id,
+            Item.expires_on.is_not(None),
+            Item.expires_on <= soon_date,
+        )
+        .order_by(Item.expires_on.asc())
+    ).all()
 
-    today = date.today()
-    soon_date = today + timedelta(days=7)
-
-    with get_db() as db:
-        # Query items expiring between today (inclusive) and soon_date (inclusive)
-        # Also include items that have already expired (expires_on < today)
-        expiring_items_rows = db.execute(text(
-            """
-            SELECT id, barcode, name, brand, quantity, unit, expires_on, created_at, image_url, category, location
-            FROM items
-            WHERE user_id = :u AND expires_on IS NOT NULL AND (expires_on <= :soon_date)
-            ORDER BY expires_on ASC
-            """
-        ), {"u": current_user.id, "soon_date": soon_date}).all()
-
-        return [ItemOut(**dict(i._mapping)) for i in expiring_items_rows]
-    
 @app.get("/stats/", response_model=StatsOut)
-def get_stats(current_user: User = Depends(get_current_user)):
-
+def get_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     today = date.today()
     expiry_date = today + timedelta(days=7)
     recent_date = today - timedelta(days=3)
 
-    with get_db() as db:
-        # Total items
-        total_items = db.execute(
-            text("SELECT COUNT(*) FROM items WHERE user_id = :u"),
-            {"u": current_user.id}
-        ).scalar_one() or 0
+    def count(*conditions) -> int:
+        return db.scalar(
+            select(func.count()).select_from(Item).where(Item.user_id == current_user.id, *conditions)
+        ) or 0
 
-        # Recently added items (last 3 days)
-        recently_added = db.execute(
-            text("SELECT COUNT(*) FROM items WHERE user_id = :u AND created_at >= :recent_date"),
-            {"u": current_user.id, "recent_date": recent_date}
-        ).scalar_one() or 0
+    return StatsOut(
+        total_items=count(),
+        recently_added=count(Item.created_at >= recent_date), # last 3 days
+        expiring_soon=count(Item.expires_on.is_not(None), Item.expires_on <= expiry_date), # next 7 days
+    )
 
-        # Expiring soon items (next 7 days)
-        expiring_soon = db.execute(
-            text("SELECT COUNT(*) FROM items WHERE user_id = :u AND expires_on IS NOT NULL AND expires_on <= :expiry_date"),
-            {"u": current_user.id, "expiry_date": expiry_date}
-        ).scalar_one() or 0
-
-        return StatsOut(
-            total_items=total_items,
-            recently_added=recently_added,
-            expiring_soon=expiring_soon
-        )
-    
 
 @app.post("/auth/request-password-reset/")
-def request_password_reset(email: EmailRequest):
-    with get_db() as db:
-        # Check if user exists
-        user = db.execute(
-            text("SELECT id FROM users WHERE email = :e"),
-            {"e": email.email}
-        ).first()
-        
-        if user:
-            expire_delta = timedelta(minutes=15)
-            reset_token = create_access_token(data={"sub": str(user[0])}, expires_delta=expire_delta)
-
-            send_password_reset_email(email.email, reset_token)
+def request_password_reset(email: EmailRequest, db: Session = Depends(get_db)):
+    # Check if user exists
+    user = db.scalar(select(User).where(User.email == email.email))
+    if user:
+        expire_delta = timedelta(minutes=15)
+        reset_token = create_access_token(data={"sub": str(user.id)}, expires_delta=expire_delta)
+        send_password_reset_email(email.email, reset_token)
 
     return {"message": "If the email is registered, a password reset link has been sent."}
 
 @app.post("/auth/reset-password/", status_code=200)
-def reset_password(request: PasswordResetRequest):
+def reset_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
     user_id = verify_password_reset_token(request.token)
     if not user_id:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
-    
-    with get_db() as db:
-        user = db.get(User, int(user_id))
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        user.password_hash = get_password_hash(request.new_password)
-        db.add(user)
-        db.commit()
+
+    user = db.get(User, int(user_id))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.password_hash = get_password_hash(request.new_password)
+    db.commit()
 
     return {"message": "Password has been reset successfully."}
 
-    
+
 # Healthcheck
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():

@@ -92,8 +92,11 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Create your env file
-cp .env.local .env
+cp .env.example .env
 # → Edit .env with your values (DB URL, JWT secret, Brevo API key)
+
+# Create the database tables
+alembic upgrade head
 
 # Run the server
 uvicorn app:app --reload
