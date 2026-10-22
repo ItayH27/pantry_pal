@@ -82,4 +82,15 @@ export const deleteItem = (itemId) => {
 	return api.delete(`/items/${itemId}`);
 };
 
+// --- Recipe Service (AI) ---
+
+export const generateRecipe = (options) => {
+	// { mode, meal_type?, dietary?, max_time_minutes?, difficulty?, cuisine? }
+	return api.post('/recipes/generate/', options);
+};
+
+export const getRecipeQuota = () => {
+	return api.get('/recipes/quota/');
+};
+
 export default api;

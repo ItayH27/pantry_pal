@@ -2,6 +2,7 @@ import { use, useEffect, useState, useMemo } from 'react';
 import { getItems, addItem, deleteItem, getExpiringItems, getStats } from '../services/api';
 import ItemCard from '../components/ItemCard';
 import ItemForm from '../components/ItemForm';
+import RecipeModal from '../components/RecipeModal';
 
 function HomePage() {
 	const [items, setItems] = useState([]);
@@ -16,6 +17,7 @@ function HomePage() {
 	const [selectedLocation, setSelectedLocation] = useState('All');
 	const [categories, setCategories] = useState(['All']);
 	const [locations, setLocations] = useState(['All']);
+	const [showRecipeModal, setShowRecipeModal] = useState(false);
 
 	const fetchItems = async () => {
 		try {
@@ -147,8 +149,18 @@ function HomePage() {
 
 			{/* Main Pantry List Container */}
 			<div>
-				{/* Page Title */}
-				<h1 className="text-3xl font-bold mb-4">Your Pantry</h1>
+				{/* Page Title + AI recipe button */}
+				<div className="flex flex-wrap justify-between items-center gap-3 mb-4">
+					<h1 className="text-3xl font-bold">Your Pantry</h1>
+					<button
+						onClick={() => setShowRecipeModal(true)}
+						disabled={items.length === 0}
+						title={items.length === 0 ? 'Add items to your pantry first' : 'Get a recipe idea from your pantry'}
+						className="px-4 py-2 bg-indigo-600 text-white rounded-md shadow hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						✨ Get a recipe
+					</button>
+				</div>
 
 				{/* Filters */}
 				<div className="flex flex-wrap gap-4">
@@ -212,6 +224,8 @@ function HomePage() {
 					))}
 				</div>
 			</div>
+
+			{showRecipeModal && <RecipeModal onClose={() => setShowRecipeModal(false)} />}
 		</div>
 	);
 }

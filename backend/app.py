@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, date
-from typing import Optional, List
+from typing import Optional, List, Literal
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
 
@@ -14,9 +14,12 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, ConfigDict
-from sqlalchemy import create_engine, select, func, Index
+from sqlalchemy import create_engine, select, delete, func, or_, Index
 from sqlalchemy.orm import Session, sessionmaker, declarative_base, Mapped, mapped_column, relationship
 from sqlalchemy import String, Integer, Date, DateTime, ForeignKey, Numeric
+from google import genai
+from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 
 load_dotenv()
 
@@ -39,6 +42,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 EMAIL_FROM = os.getenv("EMAIL_FROM")
+
+# AI recipes (Gemini)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash") # tried once when the main model is overloaded (503)
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60")) # per Gemini request
+RECIPE_LIMIT_PER_HOUR = 10 # per user, sliding window
+RECIPE_GLOBAL_DAILY_LIMIT = int(os.getenv("RECIPE_GLOBAL_DAILY_LIMIT", "500")) # across all users
+RECIPE_MAX_PANTRY_ITEMS = 150 # caps prompt size
+RECIPE_REQUESTS_RETENTION = timedelta(days=1) # longest window any limit looks at
 
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 
@@ -97,6 +110,13 @@ class Item(Base):
 
     # Speeds up the per-user expiry queries (expiring soon list + stats)
     __table_args__ = (Index("ix_items_user_expires", "user_id", "expires_on"),)
+
+# One row per Gemini recipe call; counting rows gives the usage for the rate limits
+class RecipeRequest(Base):
+    __tablename__ = "recipe_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 # Schema is managed by Alembic (see alembic/), not create_all
 
@@ -180,6 +200,44 @@ class EmailRequest(BaseModel):
 class PasswordResetRequest(BaseModel):
     token: str
     new_password: str
+
+# request body for recipe generation (fixed choices only, so no free text reaches the prompt)
+class RecipeRequestIn(BaseModel):
+    mode: Literal["prioritize_expiring", "balanced"]
+    meal_type: Optional[Literal["breakfast", "lunch", "dinner", "snack"]] = None
+    dietary: List[Literal["vegetarian", "vegan", "gluten_free", "dairy_free", "kosher", "halal",
+                          "high_protein", "low_carb", "low_calorie"]] = []
+    max_time_minutes: Optional[Literal[15, 30, 45, 60]] = None
+    difficulty: Optional[Literal["easy", "medium", "hard"]] = None
+    cuisine: Optional[Literal["italian", "asian", "mexican", "middle_eastern", "indian",
+                              "mediterranean", "american", "french"]] = None
+
+class RecipeIngredient(BaseModel):
+    name: str
+    amount: str
+    from_pantry: bool
+
+# also used as Gemini's response_schema
+class RecipeOut(BaseModel):
+    title: str
+    description: str
+    servings: int
+    total_time_minutes: int
+    difficulty: str
+    ingredients: List[RecipeIngredient]
+    missing_ingredients: List[str]
+    used_expiring_items: List[str]
+    steps: List[str]
+    nutrition_per_serving: Optional[str] = None
+
+class RecipeResponse(BaseModel):
+    recipe: RecipeOut
+    remaining_this_hour: int
+
+class RecipeQuotaOut(BaseModel):
+    limit: int
+    remaining: int
+    retry_after_seconds: Optional[int] = None
 
 # Dependency to get DB session (one per request, shared by all dependencies)
 def get_db():
@@ -281,6 +339,157 @@ def send_password_reset_email(to_email: str, token: str):
         print(f"Password reset email sent to {to_email}. Brevo response: {api_response}")
     except ApiException as e:
         print(f"Exception when sending {to_email} via Brevo: {e}")
+
+# -----------------------------
+# AI recipe helpers
+# -----------------------------
+
+_gemini_client: Optional[genai.Client] = None
+
+def get_gemini_client() -> genai.Client:
+    """Creates the Gemini client on first use, so a missing key doesn't crash the import."""
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_SECONDS * 1000), # SDK takes ms
+        )
+    return _gemini_client
+
+def recent_recipe_times(db: Session, user_id: int, now: datetime) -> List[datetime]:
+    """The user's recipe request times from the last hour, oldest first."""
+    return db.scalars(
+        select(RecipeRequest.created_at)
+        .where(RecipeRequest.user_id == user_id, RecipeRequest.created_at > now - timedelta(hours=1))
+        .order_by(RecipeRequest.created_at.asc())
+    ).all()
+
+def seconds_until_slot_frees(oldest: datetime, now: datetime) -> int:
+    return max(1, int((oldest + timedelta(hours=1) - now).total_seconds()) + 1)
+
+def cleanup_old_recipe_requests(db: Session, now: datetime):
+    """Deletes rows older than any limit window looks at, keeping the table small."""
+    db.execute(delete(RecipeRequest).where(RecipeRequest.created_at < now - RECIPE_REQUESTS_RETENTION))
+
+def reserve_recipe_slot(db: Session, user_id: int) -> tuple[int, int]:
+    """Checks the global and per-user limits and records the request. Returns (slot_id, remaining)."""
+    now = datetime.utcnow()
+
+    # Serialize concurrent requests from the same user (double-clicks, two tabs)
+    db.execute(select(User.id).where(User.id == user_id).with_for_update())
+
+    cleanup_old_recipe_requests(db, now)
+
+    # Global cap across all users
+    total_today = db.scalar(
+        select(func.count()).select_from(RecipeRequest).where(RecipeRequest.created_at > now - timedelta(days=1))
+    ) or 0
+    if total_today >= RECIPE_GLOBAL_DAILY_LIMIT:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Recipe ideas are busy right now. Please try again later.")
+
+    # Per-user cap (sliding window)
+    recent = recent_recipe_times(db, user_id, now)
+    if len(recent) >= RECIPE_LIMIT_PER_HOUR:
+        db.rollback()
+        retry_after = seconds_until_slot_frees(recent[0], now)
+        raise HTTPException(
+            status_code=429,
+            detail={"message": "Recipe limit reached", "retry_after_seconds": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    slot = RecipeRequest(user_id=user_id, created_at=now)
+    db.add(slot)
+    db.flush()
+    slot_id = slot.id # read before commit, so no new transaction stays open during the Gemini call
+    db.commit() # releases the lock before the slow Gemini call
+    return slot_id, RECIPE_LIMIT_PER_HOUR - len(recent) - 1
+
+def release_recipe_slot(db: Session, slot_id: int):
+    """Undoes a reservation when the Gemini call fails, so the user isn't charged for it."""
+    db.execute(delete(RecipeRequest).where(RecipeRequest.id == slot_id))
+    db.commit()
+
+RECIPE_SYSTEM_PROMPT = """You are a friendly home-cooking assistant.
+Create one recipe using ingredients from the user's pantry list.
+Rules:
+- Use only pantry items plus basic staples (salt, pepper, cooking oil, water).
+- If the recipe truly needs anything else, list it in missing_ingredients and keep that list short.
+- In ingredients, set from_pantry to true only for items from the pantry list.
+- Never violate the requested dietary restrictions.
+- List every pantry item marked as expiring soon that the recipe uses in used_expiring_items. Use only the item's name exactly as written in the pantry list, without quantity or expiry details.
+- Keep steps clear and concise."""
+
+def describe_item_for_prompt(item: Item, today: date) -> str:
+    name = (item.name or item.brand or "Unnamed item")[:80]
+    if item.name and item.brand:
+        name += f" ({item.brand[:40]})"
+
+    line = f"- {name}"
+    if item.quantity is not None:
+        line += f", {float(item.quantity):g} {item.unit or ''}".rstrip()
+
+    if item.expires_on is None:
+        line += " - no expiry date"
+    else:
+        days_left = (item.expires_on - today).days
+        if days_left == 0:
+            line += " - expires today [EXPIRING SOON]"
+        elif days_left <= 7:
+            line += f" - expires in {days_left} days [EXPIRING SOON]"
+        else:
+            line += f" - expires in {days_left} days"
+    return line
+
+def build_recipe_prompt(items: List[Item], req: RecipeRequestIn, today: date) -> str:
+    lines = ["Pantry items:"]
+    lines += [describe_item_for_prompt(item, today) for item in items]
+    lines.append("")
+
+    if req.mode == "prioritize_expiring":
+        lines.append("Build the recipe around as many items marked [EXPIRING SOON] as possible, so they don't go to waste.")
+    else:
+        lines.append("Treat all pantry items equally and choose whatever makes the best dish.")
+
+    if req.meal_type:
+        lines.append(f"Meal type: {req.meal_type}.")
+    if req.dietary:
+        lines.append(f"Dietary requirements: {', '.join(d.replace('_', ' ') for d in req.dietary)}.")
+    if req.max_time_minutes:
+        lines.append(f"Total time must be at most {req.max_time_minutes} minutes.")
+    if req.difficulty:
+        lines.append(f"Difficulty: {req.difficulty}.")
+    if req.cuisine:
+        lines.append(f"Cuisine: {req.cuisine.replace('_', ' ')}.")
+
+    return "\n".join(lines)
+
+def generate_recipe_with_gemini(prompt: str) -> RecipeOut:
+    """Asks Gemini for a recipe. If the main model is overloaded (503), retries once with the fallback model."""
+    config = genai_types.GenerateContentConfig(
+        system_instruction=RECIPE_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=RecipeOut,
+        max_output_tokens=2048,
+        temperature=0.9, # some variety between clicks
+        # Thinking tokens count against max_output_tokens; a recipe doesn't need them
+        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+    )
+    client = get_gemini_client()
+
+    try:
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+    except genai_errors.ServerError as e:
+        if e.code != 503 or not GEMINI_FALLBACK_MODEL:
+            raise
+        print(f"{GEMINI_MODEL} is overloaded (503), retrying with {GEMINI_FALLBACK_MODEL}")
+        response = client.models.generate_content(model=GEMINI_FALLBACK_MODEL, contents=prompt, config=config)
+
+    parsed = response.parsed
+    if parsed is None:
+        raise ValueError(f"Gemini returned no parsable recipe: {response.text!r}")
+    return parsed if isinstance(parsed, RecipeOut) else RecipeOut.model_validate(parsed)
 
 # -----------------------------
 # Routes: Auth
@@ -499,6 +708,53 @@ def reset_password(request: PasswordResetRequest, db: Session = Depends(get_db))
     db.commit()
 
     return {"message": "Password has been reset successfully."}
+
+# -----------------------------
+# Routes: Recipes (AI)
+# -----------------------------
+
+@app.post("/recipes/generate/", response_model=RecipeResponse)
+def generate_recipe(req: RecipeRequestIn, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="AI recipes are not configured.")
+
+    # Usable items: not used up, not expired; soonest-expiring first so the cap keeps the important ones
+    today = date.today()
+    items = db.scalars(
+        select(Item)
+        .where(
+            Item.user_id == current_user.id,
+            or_(Item.quantity.is_(None), Item.quantity > 0),
+            or_(Item.expires_on.is_(None), Item.expires_on >= today),
+        )
+        .order_by(Item.expires_on.asc().nulls_last(), Item.id.asc())
+        .limit(RECIPE_MAX_PANTRY_ITEMS)
+    ).all()
+    if not items:
+        raise HTTPException(status_code=400, detail="Your pantry has no usable items. Add some items first!")
+
+    prompt = build_recipe_prompt(items, req, today)
+    slot_id, remaining = reserve_recipe_slot(db, current_user.id)
+
+    try:
+        recipe = generate_recipe_with_gemini(prompt)
+    except Exception as e:
+        print(f"Recipe generation failed for user {current_user.id}: {e}")
+        release_recipe_slot(db, slot_id)
+        raise HTTPException(status_code=502, detail="Couldn't generate a recipe right now. Please try again.")
+
+    return RecipeResponse(recipe=recipe, remaining_this_hour=remaining)
+
+@app.get("/recipes/quota/", response_model=RecipeQuotaOut)
+def get_recipe_quota(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    recent = recent_recipe_times(db, current_user.id, now)
+    remaining = max(0, RECIPE_LIMIT_PER_HOUR - len(recent))
+    return RecipeQuotaOut(
+        limit=RECIPE_LIMIT_PER_HOUR,
+        remaining=remaining,
+        retry_after_seconds=seconds_until_slot_frees(recent[0], now) if remaining == 0 else None,
+    )
 
 
 # Healthcheck
