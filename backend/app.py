@@ -215,7 +215,7 @@ class RecipeRequestIn(BaseModel):
 class RecipeIngredient(BaseModel):
     name: str
     amount: str
-    from_pantry: bool
+    source: Literal["pantry", "staple", "missing"] # staple = salt/pepper/oil/water, assumed at home
 
 # also used as Gemini's response_schema
 class RecipeOut(BaseModel):
@@ -416,7 +416,8 @@ Create one recipe using ingredients from the user's pantry list.
 Rules:
 - Use only pantry items plus basic staples (salt, pepper, cooking oil, water).
 - If the recipe truly needs anything else, list it in missing_ingredients and keep that list short.
-- In ingredients, set from_pantry to true only for items from the pantry list.
+- In ingredients, set source to "pantry" for items from the pantry list, "staple" for the basic staples above,
+  and "missing" for anything the user has to buy. Never put basic staples in missing_ingredients.
 - Never violate the requested dietary restrictions.
 - List every pantry item marked as expiring soon that the recipe uses in used_expiring_items. Use only the item's name exactly as written in the pantry list, without quantity or expiry details.
 - Keep steps clear and concise."""

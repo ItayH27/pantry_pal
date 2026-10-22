@@ -194,14 +194,17 @@ function RecipeModal({ onClose }) {
 						<div>
 							<h4 className="font-semibold mb-2">Ingredients</h4>
 							<ul className="space-y-1 text-sm">
-								{recipe.ingredients.map((ing, i) => (
-									<li key={i} className={ing.from_pantry && isExpiringIngredient(ing.name) ? 'text-orange-700 font-medium' : ''}>
-										{ing.from_pantry ? '✅' : '🛒'} {ing.amount} {ing.name}
-										{ing.from_pantry && isExpiringIngredient(ing.name) && (
-											<span className="ml-2 text-xs bg-orange-100 text-orange-800 px-2 py-0.5 rounded">expiring soon</span>
-										)}
-									</li>
-								))}
+								{recipe.ingredients.map((ing, i) => {
+									const expiring = ing.source === 'pantry' && isExpiringIngredient(ing.name);
+									return (
+										<li key={i} className={expiring ? 'text-orange-700 font-medium' : ing.source === 'staple' ? 'text-gray-500' : ''}>
+											{ing.source === 'missing' ? '🛒' : '✅'} {ing.amount} {ing.name}
+											{expiring && (
+												<span className="ml-2 text-xs bg-orange-100 text-orange-800 px-2 py-0.5 rounded">expiring soon</span>
+											)}
+										</li>
+									);
+								})}
 							</ul>
 							{recipe.missing_ingredients.length > 0 && (
 								<p className="text-xs text-gray-500 mt-2">
